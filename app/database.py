@@ -5,11 +5,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Convert standard postgresql:// to async version if needed
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+# Remove sslmode/ssl query param — asyncpg handles SSL via connect_args
+DATABASE_URL = DATABASE_URL.replace("?ssl=require", "").replace("&ssl=require", "")
+DATABASE_URL = DATABASE_URL.replace("?sslmode=require", "").replace("&sslmode=require", "")
 
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
+    connect_args={"ssl": "require"}  # ← Neon requires this
 )
 
 AsyncSessionLocal = sessionmaker(
