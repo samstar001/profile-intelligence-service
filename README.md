@@ -27,7 +27,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-API docs available at: http://localhost:8000/docs
+API docs available at: http://localhost:8000/
 
 ## Live URL
-https://your-app.vercel.app
+[https://your-app.vercel.app](https://profile-intelligence-service-rcl7.vercel.app/)
