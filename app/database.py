@@ -7,18 +7,23 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Convert standard postgresql:// to async version if needed
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in .env file")
+
+# Convert to asyncpg format
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
-# Remove sslmode/ssl query param — asyncpg handles SSL via connect_args
-DATABASE_URL = DATABASE_URL.replace("?ssl=require", "").replace("&ssl=require", "")
-DATABASE_URL = DATABASE_URL.replace("?sslmode=require", "").replace("&sslmode=require", "")
+# Strip SSL params from URL — passed via connect_args instead
+for param in ["?sslmode=require", "&sslmode=require", "?ssl=require", "&ssl=require"]:
+    DATABASE_URL = DATABASE_URL.replace(param, "")
 
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    connect_args={"ssl": "require"}  # ← Neon requires this
+    connect_args={"ssl": "require"}
 )
 
 AsyncSessionLocal = sessionmaker(
