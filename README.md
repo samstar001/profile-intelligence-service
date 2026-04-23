@@ -40,27 +40,22 @@ https://profile-intelligence-service-rcl7.vercel.app
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | /api/profiles | List profiles with filtering, sorting, pagination |
-| GET | /api/profiles/search | Natural language query search |
+| POST | /api/profiles | Create a new profile |
+| GET | /api/profiles | List all profiles (filterable) |
+| GET | /api/profiles/{id} | Get profile by ID |
+| DELETE | /api/profiles/{id} | Delete a profile |
 
----
+## Running Locally
 
-## Filtering (GET /api/profiles)
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-All filters are combinable. Results strictly match all conditions.
+# Start the server
+uvicorn app.main:app --reload
+```
 
-| Parameter | Type | Example | Description |
-|-----------|------|---------|-------------|
-| gender | string | male | Filter by gender |
-| age_group | string | adult | child, teenager, adult, senior |
-| country_id | string | NG | ISO 2-letter country code |
-| min_age | int | 20 | Minimum age (inclusive) |
-| max_age | int | 40 | Maximum age (inclusive) |
-| min_gender_probability | float | 0.8 | Minimum gender confidence |
-| min_country_probability | float | 0.5 | Minimum country confidence |
-| sort_by | string | age | age, created_at, gender_probability |
-| order | string | desc | asc or desc (default: asc) |
-| page | int | 1 | Page number (default: 1) |
-| limit | int | 10 | Results per page (default: 10, max: 50) |
+API docs available at: http://localhost:8000/docs
 
-**Example:**
+## Live URL
+https://your-app.vercel.app
