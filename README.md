@@ -2,7 +2,7 @@
 
 > A secure, multi-interface demographic intelligence API built with **FastAPI**, **PostgreSQL**, and **GitHub OAuth 2.0 + PKCE**.
 
-**Live API:** `[https://live-URL.app](https://profile-intelligence-service-rcl7.vercel.app/)`
+**Live API:** `https://profile-intelligence-service-rcl7.vercel.app/`
 
 ---
 
