@@ -1,23 +1,23 @@
 import os
+import csv
+import io
+import math
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, asc, desc
 
 from app.database import get_db
-from app.models import Profile
-from app.schemas import (
-    ProfileCreate,
-    ProfileData,
-    ProfileListItem,
-    PaginatedProfileResponse,
-)
+from app.models import Profile, User
+from app.schemas import ProfileCreate, ProfileData, ProfileListItem
 from app.services.enrichment import fetch_enrichment_data
 from app.services.nlp_parser import parse_natural_language_query
+from app.dependencies import require_admin, require_any_role
+from app.auth import generate_uuid7
 
 router = APIRouter()
 
@@ -25,25 +25,42 @@ VALID_SORT_FIELDS = {"age", "created_at", "gender_probability"}
 VALID_ORDERS = {"asc", "desc"}
 
 
-# ── UUID v7 Generator ──────────────────────────────────────────────────────────
-def generate_uuid7() -> str:
-    timestamp_ms = int(time.time() * 1000)
-    ts_bytes = timestamp_ms.to_bytes(6, "big")
-    rand_bytes = os.urandom(10)
-    b = bytearray(16)
-    b[0:6] = ts_bytes
-    b[6:16] = rand_bytes
-    b[6] = (b[6] & 0x0F) | 0x70
-    b[8] = (b[8] & 0x3F) | 0x80
-    h = b.hex()
-    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+# ─── Pagination Helper ─────────────────────────────────────────────────────────
+
+def build_pagination_response(profiles, total, page, limit, base_url, query_params: dict):
+    total_pages = math.ceil(total / limit) if total > 0 else 1
+
+    def build_url(p: int) -> str:
+        params = {**query_params, "page": p, "limit": limit}
+        query_str = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        return f"{base_url}?{query_str}"
+
+    return {
+        "status": "success",
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": total_pages,
+        "links": {
+            "self": build_url(page),
+            "next": build_url(page + 1) if page < total_pages else None,
+            "prev": build_url(page - 1) if page > 1 else None,
+        },
+        "data": [
+            ProfileListItem.model_validate(p).model_dump(mode="json")
+            for p in profiles
+        ]
+    }
 
 
-# ── POST /api/profiles ─────────────────────────────────────────────────────────
+# ─── POST /api/profiles (Admin only) ──────────────────────────────────────────
+
 @router.post("/profiles")
 async def create_profile(
     body: ProfileCreate,
-    db: AsyncSession = Depends(get_db)
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
 ):
     if not body.name or not body.name.strip():
         raise HTTPException(
@@ -53,26 +70,20 @@ async def create_profile(
 
     name = body.name.strip().lower()
 
-    # Idempotency check
     result = await db.execute(select(Profile).where(Profile.name == name))
     existing = result.scalar_one_or_none()
 
     if existing:
-        # Return 200 with "already exists" message
-        from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
                 "message": "Profile already exists",
-                "data": ProfileData.model_validate(existing).model_dump(
-                    mode="json"
-                )
+                "data": ProfileData.model_validate(existing).model_dump(mode="json")
             }
         )
 
     enriched = await fetch_enrichment_data(name)
-
     profile = Profile(
         id=generate_uuid7(),
         name=name,
@@ -83,7 +94,6 @@ async def create_profile(
     await db.commit()
     await db.refresh(profile)
 
-    from fastapi.responses import JSONResponse
     return JSONResponse(
         status_code=201,
         content={
@@ -92,16 +102,87 @@ async def create_profile(
         }
     )
 
-# ── GET /api/profiles/search ───────────────────────────────────────────────────
-# NOTE: This route MUST be defined before /profiles/{profile_id}
-# otherwise FastAPI will treat "search" as a profile_id
-@router.get("/profiles/search", status_code=200)
+
+# ─── GET /api/profiles/export ─────────────────────────────────────────────────
+
+@router.get("/profiles/export")
+async def export_profiles(
+    request: Request,
+    format: str = Query(default="csv"),
+    gender: Optional[str] = Query(default=None),
+    country_id: Optional[str] = Query(default=None),
+    age_group: Optional[str] = Query(default=None),
+    min_age: Optional[int] = Query(default=None, ge=0),
+    max_age: Optional[int] = Query(default=None, ge=0),
+    sort_by: Optional[str] = Query(default=None),
+    order: Optional[str] = Query(default="asc"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_any_role),
+):
+    if format != "csv":
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Only format=csv is supported"}
+        )
+
+    query = select(Profile)
+
+    if gender:
+        query = query.where(func.lower(Profile.gender) == gender.lower())
+    if country_id:
+        query = query.where(func.upper(Profile.country_id) == country_id.upper())
+    if age_group:
+        query = query.where(func.lower(Profile.age_group) == age_group.lower())
+    if min_age is not None:
+        query = query.where(Profile.age >= min_age)
+    if max_age is not None:
+        query = query.where(Profile.age <= max_age)
+    if sort_by and sort_by in VALID_SORT_FIELDS:
+        sort_column = getattr(Profile, sort_by)
+        query = query.order_by(asc(sort_column) if order == "asc" else desc(sort_column))
+
+    result = await db.execute(query)
+    profiles = result.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "name", "gender", "gender_probability",
+        "age", "age_group", "country_id", "country_name",
+        "country_probability", "created_at"
+    ])
+    for p in profiles:
+        writer.writerow([
+            p.id, p.name, p.gender, p.gender_probability,
+            p.age, p.age_group, p.country_id, p.country_name,
+            p.country_probability,
+            p.created_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ])
+
+    output.seek(0)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"profiles_{timestamp}.csv"
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+# ─── GET /api/profiles/search ─────────────────────────────────────────────────
+
+@router.get("/profiles/search")
 async def search_profiles(
+    request: Request,
     q: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=10, ge=1, le=50),
-    db: AsyncSession = Depends(get_db)
+    limit: int = Query(default=10, ge=1),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_any_role),
 ):
+    limit = min(limit, 50)
+
     if not q or not q.strip():
         raise HTTPException(
             status_code=400,
@@ -109,7 +190,6 @@ async def search_profiles(
         )
 
     filters = parse_natural_language_query(q.strip())
-
     if filters is None:
         raise HTTPException(
             status_code=400,
@@ -117,7 +197,6 @@ async def search_profiles(
         )
 
     query = select(Profile)
-
     if "gender" in filters:
         query = query.where(Profile.gender == filters["gender"])
     if "age_group" in filters:
@@ -131,32 +210,31 @@ async def search_profiles(
     if "max_age" in filters:
         query = query.where(Profile.age <= filters["max_age"])
 
-    # Total count
     count_result = await db.execute(
         select(func.count()).select_from(query.subquery())
     )
     total = count_result.scalar()
 
-    # Paginate
     offset = (page - 1) * limit
     query = query.offset(offset).limit(limit)
-
     result = await db.execute(query)
     profiles = result.scalars().all()
 
-    return {
-        "status": "success",
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "data": [ProfileListItem.model_validate(p) for p in profiles]
-    }
+    return JSONResponse(
+        status_code=200,
+        content=build_pagination_response(
+            profiles, total, page, limit,
+            "/api/profiles/search",
+            {"q": q}
+        )
+    )
 
 
-# ── GET /api/profiles ──────────────────────────────────────────────────────────
-@router.get("/profiles", status_code=200)
+# ─── GET /api/profiles ────────────────────────────────────────────────────────
+
+@router.get("/profiles")
 async def list_profiles(
-    # Filters
+    request: Request,
     gender: Optional[str] = Query(default=None),
     country_id: Optional[str] = Query(default=None),
     age_group: Optional[str] = Query(default=None),
@@ -164,42 +242,32 @@ async def list_profiles(
     max_age: Optional[int] = Query(default=None, ge=0),
     min_gender_probability: Optional[float] = Query(default=None, ge=0.0, le=1.0),
     min_country_probability: Optional[float] = Query(default=None, ge=0.0, le=1.0),
-    # Sorting
     sort_by: Optional[str] = Query(default=None),
     order: Optional[str] = Query(default="asc"),
-    # Pagination
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=10, ge=1, le=50),
-    db: AsyncSession = Depends(get_db)
+    limit: int = Query(default=10, ge=1),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_any_role),
 ):
-    # Validate sort_by and order
+    limit = min(limit, 50)
+
     if sort_by and sort_by not in VALID_SORT_FIELDS:
         raise HTTPException(
             status_code=400,
-            detail={
-                "status": "error",
-                "message": f"Invalid sort_by. Must be one of: {', '.join(VALID_SORT_FIELDS)}"
-            }
+            detail={"status": "error", "message": "Invalid query parameters"}
         )
-
     if order not in VALID_ORDERS:
         raise HTTPException(
             status_code=400,
-            detail={
-                "status": "error",
-                "message": "Invalid order. Must be 'asc' or 'desc'"
-            }
+            detail={"status": "error", "message": "Invalid query parameters"}
         )
 
     query = select(Profile)
 
-    # ── Apply filters ──────────────────────────────────────────────────────────
     if gender:
         query = query.where(func.lower(Profile.gender) == gender.lower())
     if country_id:
-        query = query.where(
-            func.upper(Profile.country_id) == country_id.upper()
-        )
+        query = query.where(func.upper(Profile.country_id) == country_id.upper())
     if age_group:
         query = query.where(func.lower(Profile.age_group) == age_group.lower())
     if min_age is not None:
@@ -210,39 +278,50 @@ async def list_profiles(
         query = query.where(Profile.gender_probability >= min_gender_probability)
     if min_country_probability is not None:
         query = query.where(Profile.country_probability >= min_country_probability)
-
-    # ── Apply sorting ──────────────────────────────────────────────────────────
     if sort_by:
         sort_column = getattr(Profile, sort_by)
-        query = query.order_by(asc(sort_column) if order == "asc" else desc(sort_column))
+        query = query.order_by(
+            asc(sort_column) if order == "asc" else desc(sort_column)
+        )
 
-    # ── Total count before pagination ──────────────────────────────────────────
     count_result = await db.execute(
         select(func.count()).select_from(query.subquery())
     )
     total = count_result.scalar()
 
-    # ── Apply pagination ───────────────────────────────────────────────────────
     offset = (page - 1) * limit
     query = query.offset(offset).limit(limit)
-
     result = await db.execute(query)
     profiles = result.scalars().all()
 
-    return {
-        "status": "success",
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "data": [ProfileListItem.model_validate(p) for p in profiles]
+    query_params = {
+        k: v for k, v in {
+            "gender": gender,
+            "country_id": country_id,
+            "age_group": age_group,
+            "min_age": min_age,
+            "max_age": max_age,
+            "sort_by": sort_by,
+            "order": order if sort_by else None,
+        }.items() if v is not None
     }
 
+    return JSONResponse(
+        status_code=200,
+        content=build_pagination_response(
+            profiles, total, page, limit,
+            "/api/profiles", query_params
+        )
+    )
 
-# ── GET /api/profiles/{id} ─────────────────────────────────────────────────────
-@router.get("/profiles/{profile_id}", status_code=200)
+
+# ─── GET /api/profiles/{id} ───────────────────────────────────────────────────
+
+@router.get("/profiles/{profile_id}")
 async def get_profile(
     profile_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_any_role),
 ):
     result = await db.execute(
         select(Profile).where(Profile.id == profile_id)
@@ -255,17 +334,22 @@ async def get_profile(
             detail={"status": "error", "message": "Profile not found"}
         )
 
-    return {
-        "status": "success",
-        "data": ProfileData.model_validate(profile)
-    }
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "data": ProfileData.model_validate(profile).model_dump(mode="json")
+        }
+    )
 
 
-# ── DELETE /api/profiles/{id} ──────────────────────────────────────────────────
+# ─── DELETE /api/profiles/{id} (Admin only) ───────────────────────────────────
+
 @router.delete("/profiles/{profile_id}", status_code=204)
 async def delete_profile(
     profile_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
 ):
     result = await db.execute(
         select(Profile).where(Profile.id == profile_id)
