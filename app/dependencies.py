@@ -134,4 +134,4 @@ require_admin = require_role("admin")
 
 require_any_role = require_role("admin", "analyst")
 # Use as: current_user: User = Depends(require_any_role)
-# Allows both admin and analyst roles
+# Allows both admin and analyst rolesfd
