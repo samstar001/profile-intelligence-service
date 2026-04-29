@@ -337,3 +337,99 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "status": "success",
         "data": UserResponse.model_validate(current_user).model_dump(mode="json")
     }
+
+@router.post("/logout-cookie")
+async def logout_cookie(
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """Web portal logout — reads refresh token from cookie."""
+    refresh_token_value = request.cookies.get("refresh_token")
+
+    if refresh_token_value:
+        result = await db.execute(
+            select(RefreshToken).where(RefreshToken.token == refresh_token_value)
+        )
+        token_record = result.scalar_one_or_none()
+        if token_record:
+            token_record.is_used = True
+            await db.commit()
+
+    response = JSONResponse(
+        status_code=200,
+        content={"status": "success", "message": "Logged out successfully"}
+    )
+    # Clear the cookies
+    response.delete_cookie("access_token")
+    response.delete_cookie("refresh_token")
+    return response
+
+
+@router.post("/refresh-cookie")
+async def refresh_cookie(
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """Web portal token refresh — reads/writes HTTP-only cookies."""
+    refresh_token_value = request.cookies.get("refresh_token")
+
+    if not refresh_token_value:
+        raise HTTPException(
+            status_code=401,
+            detail={"status": "error", "message": "No refresh token"}
+        )
+
+    payload = verify_refresh_token(refresh_token_value)
+    if not payload:
+        raise HTTPException(
+            status_code=401,
+            detail={"status": "error", "message": "Invalid or expired refresh token"}
+        )
+
+    result = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.token == refresh_token_value,
+            RefreshToken.is_used == False
+        )
+    )
+    token_record = result.scalar_one_or_none()
+    if not token_record:
+        raise HTTPException(
+            status_code=401,
+            detail={"status": "error", "message": "Refresh token already used"}
+        )
+
+    token_record.is_used = True
+    await db.commit()
+
+    user_id = payload.get("sub")
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail={"status": "error", "message": "User not found or inactive"}
+        )
+
+    new_access_token = create_access_token(user.id, user.username, user.role)
+    new_refresh_token = create_refresh_token(user.id)
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.add(RefreshToken(
+        id=generate_uuid7(),
+        token=new_refresh_token,
+        user_id=user.id,
+        expires_at=get_token_expiry(REFRESH_TOKEN_EXPIRE_MINUTES).replace(tzinfo=None),
+        is_used=False,
+        created_at=now,
+    ))
+    await db.commit()
+
+    response = JSONResponse(
+        status_code=200,
+        content={"status": "success"}
+    )
+    response.set_cookie(key="access_token", value=new_access_token, httponly=True, secure=False, samesite="lax", max_age=3*60)
+    response.set_cookie(key="refresh_token", value=new_refresh_token, httponly=True, secure=False, samesite="lax", max_age=5*60)
+    return response
