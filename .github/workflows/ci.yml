@@ -1,0 +1,57 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest
+
+      - name: Lint with Ruff
+        run: ruff check . --ignore E501
+
+      - name: Check imports
+        run: |
+          python -c "from app.main import app; print('App imports OK')"
+          python -c "from app.models import Profile, User; print('Models OK')"
+          python -c "from app.routes.auth import router; print('Auth routes OK')"
+          python -c "from app.routes.profiles import router; print('Profile routes OK')"
+
+      - name: Verify app starts
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./test.db
+          GITHUB_CLIENT_ID: test_client_id
+          GITHUB_CLIENT_SECRET: test_client_secret
+          GITHUB_REDIRECT_URI: http://localhost:8000/auth/github/callback
+          JWT_SECRET_KEY: test_secret_key_for_ci
+          JWT_ALGORITHM: HS256
+          ACCESS_TOKEN_EXPIRE_MINUTES: "3"
+          REFRESH_TOKEN_EXPIRE_MINUTES: "5"
+          FRONTEND_URL: http://localhost:5173
+        run: |
+          python -c "
+          from app.main import app
+          from fastapi.testclient import TestClient
+          client = TestClient(app)
+          response = client.get('/')
+          assert response.status_code == 200
+          print('Health check passed:', response.json())
+          "
