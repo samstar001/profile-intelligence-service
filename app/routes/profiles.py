@@ -13,7 +13,7 @@ from sqlalchemy import select, func, asc, desc
 
 from app.database import get_db
 from app.models import Profile, User
-from app.schemas import ProfileCreate, ProfileData, ProfileListItem
+from app.schemas import ProfileCreate, ProfileData, ProfileListItem, UserResponse
 from app.services.enrichment import fetch_enrichment_data
 from app.services.nlp_parser import parse_natural_language_query
 from app.dependencies import require_admin, require_any_role
@@ -27,12 +27,16 @@ VALID_ORDERS = {"asc", "desc"}
 
 # ─── Pagination Helper ─────────────────────────────────────────────────────────
 
-def build_pagination_response(profiles, total, page, limit, base_url, query_params: dict):
+def build_pagination_response(
+    profiles, total, page, limit, base_url, query_params: dict
+):
     total_pages = math.ceil(total / limit) if total > 0 else 1
 
     def build_url(p: int) -> str:
         params = {**query_params, "page": p, "limit": limit}
-        query_str = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        query_str = "&".join(
+            f"{k}={v}" for k, v in params.items() if v is not None
+        )
         return f"{base_url}?{query_str}"
 
     return {
@@ -53,6 +57,27 @@ def build_pagination_response(profiles, total, page, limit, base_url, query_para
     }
 
 
+# ─── GET /api/users/me ────────────────────────────────────────────────────────
+
+@router.get("/users/me")
+async def get_current_user_profile(
+    current_user: User = Depends(require_any_role),
+):
+    """
+    Returns the current authenticated user's profile.
+    Accessible by both admin and analyst roles.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "data": UserResponse.model_validate(
+                current_user
+            ).model_dump(mode="json")
+        }
+    )
+
+
 # ─── POST /api/profiles (Admin only) ──────────────────────────────────────────
 
 @router.post("/profiles")
@@ -70,7 +95,9 @@ async def create_profile(
 
     name = body.name.strip().lower()
 
-    result = await db.execute(select(Profile).where(Profile.name == name))
+    result = await db.execute(
+        select(Profile).where(Profile.name == name)
+    )
     existing = result.scalar_one_or_none()
 
     if existing:
@@ -79,7 +106,9 @@ async def create_profile(
             content={
                 "status": "success",
                 "message": "Profile already exists",
-                "data": ProfileData.model_validate(existing).model_dump(mode="json")
+                "data": ProfileData.model_validate(
+                    existing
+                ).model_dump(mode="json")
             }
         )
 
@@ -122,7 +151,10 @@ async def export_profiles(
     if format != "csv":
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": "Only format=csv is supported"}
+            detail={
+                "status": "error",
+                "message": "Only format=csv is supported"
+            }
         )
 
     query = select(Profile)
@@ -130,16 +162,22 @@ async def export_profiles(
     if gender:
         query = query.where(func.lower(Profile.gender) == gender.lower())
     if country_id:
-        query = query.where(func.upper(Profile.country_id) == country_id.upper())
+        query = query.where(
+            func.upper(Profile.country_id) == country_id.upper()
+        )
     if age_group:
-        query = query.where(func.lower(Profile.age_group) == age_group.lower())
+        query = query.where(
+            func.lower(Profile.age_group) == age_group.lower()
+        )
     if min_age is not None:
         query = query.where(Profile.age >= min_age)
     if max_age is not None:
         query = query.where(Profile.age <= max_age)
     if sort_by and sort_by in VALID_SORT_FIELDS:
         sort_column = getattr(Profile, sort_by)
-        query = query.order_by(asc(sort_column) if order == "asc" else desc(sort_column))
+        query = query.order_by(
+            asc(sort_column) if order == "asc" else desc(sort_column)
+        )
 
     result = await db.execute(query)
     profiles = result.scalars().all()
@@ -166,7 +204,9 @@ async def export_profiles(
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
     )
 
 
@@ -186,14 +226,20 @@ async def search_profiles(
     if not q or not q.strip():
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": "Query parameter 'q' is required"}
+            detail={
+                "status": "error",
+                "message": "Query parameter 'q' is required"
+            }
         )
 
     filters = parse_natural_language_query(q.strip())
     if filters is None:
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": "Unable to interpret query"}
+            detail={
+                "status": "error",
+                "message": "Unable to interpret query"
+            }
         )
 
     query = select(Profile)
@@ -224,8 +270,7 @@ async def search_profiles(
         status_code=200,
         content=build_pagination_response(
             profiles, total, page, limit,
-            "/api/profiles/search",
-            {"q": q}
+            "/api/profiles/search", {"q": q}
         )
     )
 
@@ -240,8 +285,12 @@ async def list_profiles(
     age_group: Optional[str] = Query(default=None),
     min_age: Optional[int] = Query(default=None, ge=0),
     max_age: Optional[int] = Query(default=None, ge=0),
-    min_gender_probability: Optional[float] = Query(default=None, ge=0.0, le=1.0),
-    min_country_probability: Optional[float] = Query(default=None, ge=0.0, le=1.0),
+    min_gender_probability: Optional[float] = Query(
+        default=None, ge=0.0, le=1.0
+    ),
+    min_country_probability: Optional[float] = Query(
+        default=None, ge=0.0, le=1.0
+    ),
     sort_by: Optional[str] = Query(default=None),
     order: Optional[str] = Query(default="asc"),
     page: int = Query(default=1, ge=1),
@@ -254,30 +303,46 @@ async def list_profiles(
     if sort_by and sort_by not in VALID_SORT_FIELDS:
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": "Invalid query parameters"}
+            detail={
+                "status": "error",
+                "message": "Invalid query parameters"
+            }
         )
     if order not in VALID_ORDERS:
         raise HTTPException(
             status_code=400,
-            detail={"status": "error", "message": "Invalid query parameters"}
+            detail={
+                "status": "error",
+                "message": "Invalid query parameters"
+            }
         )
 
     query = select(Profile)
 
     if gender:
-        query = query.where(func.lower(Profile.gender) == gender.lower())
+        query = query.where(
+            func.lower(Profile.gender) == gender.lower()
+        )
     if country_id:
-        query = query.where(func.upper(Profile.country_id) == country_id.upper())
+        query = query.where(
+            func.upper(Profile.country_id) == country_id.upper()
+        )
     if age_group:
-        query = query.where(func.lower(Profile.age_group) == age_group.lower())
+        query = query.where(
+            func.lower(Profile.age_group) == age_group.lower()
+        )
     if min_age is not None:
         query = query.where(Profile.age >= min_age)
     if max_age is not None:
         query = query.where(Profile.age <= max_age)
     if min_gender_probability is not None:
-        query = query.where(Profile.gender_probability >= min_gender_probability)
+        query = query.where(
+            Profile.gender_probability >= min_gender_probability
+        )
     if min_country_probability is not None:
-        query = query.where(Profile.country_probability >= min_country_probability)
+        query = query.where(
+            Profile.country_probability >= min_country_probability
+        )
     if sort_by:
         sort_column = getattr(Profile, sort_by)
         query = query.order_by(
@@ -338,7 +403,9 @@ async def get_profile(
         status_code=200,
         content={
             "status": "success",
-            "data": ProfileData.model_validate(profile).model_dump(mode="json")
+            "data": ProfileData.model_validate(
+                profile
+            ).model_dump(mode="json")
         }
     )
 

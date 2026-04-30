@@ -1,10 +1,13 @@
 import os
 import httpx
 from datetime import datetime, timezone
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from dotenv import load_dotenv
 
 from app.database import get_db
@@ -23,6 +26,7 @@ from app.dependencies import get_current_user
 load_dotenv()
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
@@ -33,20 +37,21 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 # ─── GET /auth/github ──────────────────────────────────────────────────────────
 
 @router.get("/github")
+@limiter.limit("10/minute")
 async def github_login(request: Request):
     """
     Redirects to GitHub OAuth page.
-    Encodes 'source' (cli or web) into the state parameter
-    so it survives the GitHub redirect back to our callback.
+    Encodes source (cli/web) into state so it survives the redirect.
+    Rate limited to 10 requests per minute.
     """
     source = request.query_params.get("source", "web")
     base_state = generate_uuid7()
-
-    # Format: "uuid:source" e.g. "019dce48-5347-7ed3-a1cb-48206ebc98c8:cli"
     state = f"{base_state}:{source}"
 
     code_challenge = request.query_params.get("code_challenge")
-    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+    code_challenge_method = request.query_params.get(
+        "code_challenge_method", "S256"
+    )
 
     params = {
         "client_id": GITHUB_CLIENT_ID,
@@ -69,22 +74,29 @@ async def github_login(request: Request):
 @router.get("/github/callback")
 async def github_callback(
     request: Request,
-    code: str,
-    state: str,
     db: AsyncSession = Depends(get_db),
+    code: Optional[str] = None,
+    state: Optional[str] = None,
 ):
     """
     GitHub redirects here after user authorizes.
-    1. Extracts source from state
-    2. Exchanges code for GitHub access token
-    3. Fetches GitHub user info
-    4. Creates or updates user in database
-    5. Issues access + refresh tokens
-    6. Returns JSON (CLI) or sets cookies and redirects (web)
+    Validates code and state, exchanges for tokens, creates/updates user.
     """
 
-    # ── Extract source from state ──────────────────────────────────────────
-    # State format: "uuid:source" e.g. "019dce48-5347-7ed3-a1cb:cli"
+    # ── Validate required parameters ──────────────────────────────────────
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Missing code parameter"}
+        )
+
+    if not state:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Missing state parameter"}
+        )
+
+    # ── Extract source from state (format: "uuid:source") ─────────────────
     state_parts = state.split(":", 1)
     source = state_parts[1] if len(state_parts) > 1 else "web"
 
@@ -110,9 +122,16 @@ async def github_callback(
 
     github_access_token = token_json.get("access_token")
     if not github_access_token:
+        github_error = token_json.get("error", "unknown")
+        github_error_desc = token_json.get(
+            "error_description", "no description"
+        )
         raise HTTPException(
-            status_code=502,
-            detail={"status": "error", "message": "Failed to get token from GitHub"}
+            status_code=400,
+            detail={
+                "status": "error",
+                "message": f"Invalid code or state: {github_error} - {github_error_desc}"
+            }
         )
 
     # ── Fetch user info from GitHub ────────────────────────────────────────
@@ -147,7 +166,7 @@ async def github_callback(
     username = github_user.get("login")
     avatar_url = github_user.get("avatar_url")
 
-    # ── Create or update user in database ─────────────────────────────────
+    # ── Create or update user ──────────────────────────────────────────────
     result = await db.execute(
         select(User).where(User.github_id == github_id)
     )
@@ -155,7 +174,6 @@ async def github_callback(
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     if not user:
-        # First time login — create new user with analyst role
         user = User(
             id=generate_uuid7(),
             github_id=github_id,
@@ -169,7 +187,6 @@ async def github_callback(
         )
         db.add(user)
     else:
-        # Returning user — update their profile info
         user.username = username
         user.email = primary_email or user.email
         user.avatar_url = avatar_url
@@ -178,25 +195,24 @@ async def github_callback(
     await db.commit()
     await db.refresh(user)
 
-    # ── Issue access + refresh tokens ──────────────────────────────────────
+    # ── Issue tokens ───────────────────────────────────────────────────────
     access_token = create_access_token(user.id, user.username, user.role)
     refresh_token_str = create_refresh_token(user.id)
 
-    # Save refresh token to database
-    refresh_token_record = RefreshToken(
+    db.add(RefreshToken(
         id=generate_uuid7(),
         token=refresh_token_str,
         user_id=user.id,
-        expires_at=get_token_expiry(REFRESH_TOKEN_EXPIRE_MINUTES).replace(tzinfo=None),
+        expires_at=get_token_expiry(
+            REFRESH_TOKEN_EXPIRE_MINUTES
+        ).replace(tzinfo=None),
         is_used=False,
         created_at=now,
-    )
-    db.add(refresh_token_record)
+    ))
     await db.commit()
 
-    # ── Return response based on source ───────────────────────────────────
+    # ── Return based on source ─────────────────────────────────────────────
     if source == "cli":
-        # CLI gets tokens as JSON in response body
         return JSONResponse(content={
             "status": "success",
             "access_token": access_token,
@@ -205,23 +221,14 @@ async def github_callback(
             "role": user.role,
         })
 
-    # Web portal gets tokens as HTTP-only cookies + redirect to dashboard
     response = RedirectResponse(url=f"{FRONTEND_URL}/dashboard")
     response.set_cookie(
-        key="access_token",
-        value=access_token,
-        httponly=True,       # Not accessible via JavaScript (security)
-        secure=False,        # Set to True in production (HTTPS)
-        samesite="lax",      # CSRF protection
-        max_age=3 * 60,      # 3 minutes — matches ACCESS_TOKEN_EXPIRE_MINUTES
+        key="access_token", value=access_token,
+        httponly=True, secure=False, samesite="lax", max_age=3 * 60
     )
     response.set_cookie(
-        key="refresh_token",
-        value=refresh_token_str,
-        httponly=True,
-        secure=False,
-        samesite="lax",
-        max_age=5 * 60,      # 5 minutes — matches REFRESH_TOKEN_EXPIRE_MINUTES
+        key="refresh_token", value=refresh_token_str,
+        httponly=True, secure=False, samesite="lax", max_age=5 * 60
     )
     return response
 
@@ -229,23 +236,33 @@ async def github_callback(
 # ─── POST /auth/refresh ───────────────────────────────────────────────────────
 
 @router.post("/refresh")
+@limiter.limit("10/minute")
 async def refresh_token(
+    request: Request,
     body: RefreshTokenRequest,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Issues new access + refresh tokens using a valid refresh token.
-    The old refresh token is immediately invalidated (one-time use only).
+    Issues new token pair using a valid refresh token.
+    Old refresh token is immediately invalidated (one-time use).
+    Rate limited to 10 requests per minute.
     """
-    # Verify JWT signature and expiry
+    if not body.refresh_token or not body.refresh_token.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "refresh_token is required"}
+        )
+
     payload = verify_refresh_token(body.refresh_token)
     if not payload:
         raise HTTPException(
             status_code=401,
-            detail={"status": "error", "message": "Invalid or expired refresh token"}
+            detail={
+                "status": "error",
+                "message": "Invalid or expired refresh token"
+            }
         )
 
-    # Check token exists in DB and hasn't been used
     result = await db.execute(
         select(RefreshToken).where(
             RefreshToken.token == body.refresh_token,
@@ -257,14 +274,16 @@ async def refresh_token(
     if not token_record:
         raise HTTPException(
             status_code=401,
-            detail={"status": "error", "message": "Refresh token already used"}
+            detail={
+                "status": "error",
+                "message": "Refresh token already used or not found"
+            }
         )
 
-    # Invalidate the old token immediately
+    # Invalidate immediately
     token_record.is_used = True
     await db.commit()
 
-    # Fetch the user
     user_id = payload.get("sub")
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -275,7 +294,6 @@ async def refresh_token(
             detail={"status": "error", "message": "User not found or inactive"}
         )
 
-    # Issue brand new token pair
     new_access_token = create_access_token(user.id, user.username, user.role)
     new_refresh_token = create_refresh_token(user.id)
 
@@ -284,33 +302,47 @@ async def refresh_token(
         id=generate_uuid7(),
         token=new_refresh_token,
         user_id=user.id,
-        expires_at=get_token_expiry(REFRESH_TOKEN_EXPIRE_MINUTES).replace(tzinfo=None),
+        expires_at=get_token_expiry(
+            REFRESH_TOKEN_EXPIRE_MINUTES
+        ).replace(tzinfo=None),
         is_used=False,
         created_at=now,
     ))
     await db.commit()
 
-    return {
-        "status": "success",
-        "access_token": new_access_token,
-        "refresh_token": new_refresh_token,
-    }
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "access_token": new_access_token,
+            "refresh_token": new_refresh_token,
+        }
+    )
 
 
 # ─── POST /auth/logout ────────────────────────────────────────────────────────
 
 @router.post("/logout")
+@limiter.limit("10/minute")
 async def logout(
+    request: Request,
     body: RefreshTokenRequest,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Invalidates the refresh token server-side.
-    Client should also delete their locally stored tokens after this.
-    Always returns 200 even if token not found (safe logout).
+    Invalidates refresh token server-side.
+    Rate limited to 10 requests per minute.
     """
+    if not body.refresh_token or not body.refresh_token.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "refresh_token is required"}
+        )
+
     result = await db.execute(
-        select(RefreshToken).where(RefreshToken.token == body.refresh_token)
+        select(RefreshToken).where(
+            RefreshToken.token == body.refresh_token
+        )
     )
     token_record = result.scalar_one_or_none()
 
@@ -324,31 +356,21 @@ async def logout(
     )
 
 
-# ─── GET /auth/me ─────────────────────────────────────────────────────────────
-
-@router.get("/me")
-async def get_me(current_user: User = Depends(get_current_user)):
-    """
-    Returns the currently authenticated user's profile.
-    Used by CLI 'insighta whoami' command and web portal account page.
-    Requires a valid Bearer token in Authorization header.
-    """
-    return {
-        "status": "success",
-        "data": UserResponse.model_validate(current_user).model_dump(mode="json")
-    }
+# ─── POST /auth/logout-cookie ─────────────────────────────────────────────────
 
 @router.post("/logout-cookie")
 async def logout_cookie(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
-    """Web portal logout — reads refresh token from cookie."""
+    """Web portal logout — reads refresh token from HTTP-only cookie."""
     refresh_token_value = request.cookies.get("refresh_token")
 
     if refresh_token_value:
         result = await db.execute(
-            select(RefreshToken).where(RefreshToken.token == refresh_token_value)
+            select(RefreshToken).where(
+                RefreshToken.token == refresh_token_value
+            )
         )
         token_record = result.scalar_one_or_none()
         if token_record:
@@ -359,11 +381,12 @@ async def logout_cookie(
         status_code=200,
         content={"status": "success", "message": "Logged out successfully"}
     )
-    # Clear the cookies
     response.delete_cookie("access_token")
     response.delete_cookie("refresh_token")
     return response
 
+
+# ─── POST /auth/refresh-cookie ────────────────────────────────────────────────
 
 @router.post("/refresh-cookie")
 async def refresh_cookie(
@@ -376,14 +399,17 @@ async def refresh_cookie(
     if not refresh_token_value:
         raise HTTPException(
             status_code=401,
-            detail={"status": "error", "message": "No refresh token"}
+            detail={"status": "error", "message": "No refresh token cookie"}
         )
 
     payload = verify_refresh_token(refresh_token_value)
     if not payload:
         raise HTTPException(
             status_code=401,
-            detail={"status": "error", "message": "Invalid or expired refresh token"}
+            detail={
+                "status": "error",
+                "message": "Invalid or expired refresh token"
+            }
         )
 
     result = await db.execute(
@@ -396,7 +422,10 @@ async def refresh_cookie(
     if not token_record:
         raise HTTPException(
             status_code=401,
-            detail={"status": "error", "message": "Refresh token already used"}
+            detail={
+                "status": "error",
+                "message": "Refresh token already used"
+            }
         )
 
     token_record.is_used = True
@@ -420,7 +449,9 @@ async def refresh_cookie(
         id=generate_uuid7(),
         token=new_refresh_token,
         user_id=user.id,
-        expires_at=get_token_expiry(REFRESH_TOKEN_EXPIRE_MINUTES).replace(tzinfo=None),
+        expires_at=get_token_expiry(
+            REFRESH_TOKEN_EXPIRE_MINUTES
+        ).replace(tzinfo=None),
         is_used=False,
         created_at=now,
     ))
@@ -430,6 +461,28 @@ async def refresh_cookie(
         status_code=200,
         content={"status": "success"}
     )
-    response.set_cookie(key="access_token", value=new_access_token, httponly=True, secure=False, samesite="lax", max_age=3*60)
-    response.set_cookie(key="refresh_token", value=new_refresh_token, httponly=True, secure=False, samesite="lax", max_age=5*60)
+    response.set_cookie(
+        key="access_token", value=new_access_token,
+        httponly=True, secure=False, samesite="lax", max_age=3 * 60
+    )
+    response.set_cookie(
+        key="refresh_token", value=new_refresh_token,
+        httponly=True, secure=False, samesite="lax", max_age=5 * 60
+    )
     return response
+
+
+# ─── GET /auth/me ─────────────────────────────────────────────────────────────
+
+@router.get("/me")
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Returns the currently authenticated user's profile."""
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "data": UserResponse.model_validate(
+                current_user
+            ).model_dump(mode="json")
+        }
+    )

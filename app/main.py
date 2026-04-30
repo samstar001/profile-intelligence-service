@@ -23,7 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-limiter = Limiter(key_func=get_remote_address)
+# ─── Rate Limiter ─────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 
 @asynccontextmanager
@@ -38,30 +39,29 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Attach rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+# ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
+# ─── Request Logging + API Version Check ──────────────────────────────────────
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """
-    Runs on every request.
-    1. Checks X-API-Version header on all /api/* routes FIRST (before auth)
-    2. Logs method, path, status code, response time
-    """
     start_time = time.time()
 
-    # API Version check runs BEFORE auth so it always returns 400 first
+    # API Version check BEFORE auth on all /api/* routes
     if request.url.path.startswith("/api/"):
         api_version = request.headers.get("x-api-version")
         if not api_version or api_version.strip() != "1":
@@ -75,7 +75,6 @@ async def log_requests(request: Request, call_next):
 
     response = await call_next(request)
     duration = round((time.time() - start_time) * 1000, 2)
-
     logger.info(
         f"{request.method} {request.url.path} "
         f"→ {response.status_code} ({duration}ms)"
@@ -83,6 +82,7 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+# ─── Error Handlers ───────────────────────────────────────────────────────────
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
@@ -99,10 +99,12 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ─── Routers ──────────────────────────────────────────────────────────────────
 app.include_router(auth_router, prefix="/auth", tags=["Auth"])
 app.include_router(profiles_router, prefix="/api", tags=["Profiles"])
 
 
+# ─── Health Check ─────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
