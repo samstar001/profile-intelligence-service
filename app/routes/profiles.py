@@ -3,17 +3,20 @@ import csv
 import io
 import math
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, JSONResponse, StreamingResponse
+from fastapi import UploadFile, File, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, asc, desc
 
 from app.database import get_db
 from app.models import Profile, User
 from app.schemas import ProfileCreate, ProfileData, ProfileListItem, UserResponse
+from app.schemas import CSVUploadResponse, SkipReasons
 from app.services.enrichment import fetch_enrichment_data
 from app.services.nlp_parser import parse_natural_language_query
 from app.dependencies import require_admin, require_any_role
@@ -208,6 +211,209 @@ async def export_profiles(
             "Content-Disposition": f"attachment; filename={filename}"
         }
     )
+
+# ─── POST /api/profiles/upload (Admin only) ───────────────────────────────────
+
+VALID_GENDERS   = {"male", "female"}
+VALID_AGE_GROUPS = {"child", "teenager", "adult", "senior"}
+REQUIRED_FIELDS  = {"name", "gender", "gender_probability", "age",
+                    "age_group", "country_id", "country_name", "country_probability"}
+BATCH_SIZE = 1000
+
+
+def validate_row(row: dict) -> tuple[bool, str]:
+    # Check all required fields present and non-empty
+    for field in REQUIRED_FIELDS:
+        if not row.get(field, "").strip():
+            return False, "missing_fields"
+
+    # Validate gender
+    if row["gender"].strip().lower() not in VALID_GENDERS:
+        return False, "invalid_gender"
+
+    # Validate age
+    try:
+        age = int(row["age"])
+        if age < 0 or age > 150:
+            return False, "invalid_age"
+    except (ValueError, TypeError):
+        return False, "invalid_age"
+
+    # Validate probabilities
+    try:
+        gp = float(row["gender_probability"])
+        cp = float(row["country_probability"])
+        if not (0.0 <= gp <= 1.0) or not (0.0 <= cp <= 1.0):
+            return False, "invalid_age"
+    except (ValueError, TypeError):
+        return False, "malformed_row"
+
+    return True, ""
+
+
+async def insert_batch(session, batch: list) -> int:
+    # Bulk insert using insert().values() — much faster than one-by-one
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy import insert as sa_insert
+
+    if not batch:
+        return 0
+
+    try:
+        stmt = sa_insert(Profile).values(batch)
+        await session.execute(stmt)
+        await session.commit()
+        return len(batch)
+    except Exception:
+        await session.rollback()
+        return 0
+
+
+@router.post("/profiles/upload", response_model=CSVUploadResponse)
+async def upload_csv(
+    request: Request,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    # ── Validate file type ─────────────────────────────────────────────────
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Only CSV files are accepted"}
+        )
+
+    # ── Counters ───────────────────────────────────────────────────────────
+    total_rows      = 0
+    inserted_count  = 0
+    skip_reasons    = {
+        "duplicate_name": 0,
+        "invalid_age": 0,
+        "invalid_gender": 0,
+        "missing_fields": 0,
+        "malformed_row": 0,
+    }
+
+    # ── Stream and process in batches ──────────────────────────────────────
+    batch_to_insert = []
+
+    try:
+        # Read file content — stream via SpooledTemporaryFile
+        content = await file.read()
+        text    = content.decode("utf-8", errors="replace")
+        reader  = csv.DictReader(io.StringIO(text))
+
+        # Verify required headers exist
+        if not reader.fieldnames:
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "error", "message": "CSV file is empty or has no headers"}
+            )
+
+        missing_headers = REQUIRED_FIELDS - set(f.strip() for f in reader.fieldnames)
+        if missing_headers:
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "error", "message": f"Missing CSV columns: {missing_headers}"}
+            )
+
+        # ── Collect all names in this file for bulk duplicate check ────────
+        all_names_in_file = []
+        all_rows          = []
+
+        for row in reader:
+            total_rows += 1
+
+            # Skip malformed rows (wrong column count)
+            if len(row) < len(REQUIRED_FIELDS):
+                skip_reasons["malformed_row"] += 1
+                continue
+
+            valid, reason = validate_row(row)
+            if not valid:
+                skip_reasons[reason] += 1
+                continue
+
+            name = row["name"].strip().lower()
+            all_names_in_file.append(name)
+            all_rows.append(row)
+
+        # ── Bulk check which names already exist in database ───────────────
+        if all_names_in_file:
+            existing_result = await db.execute(
+                select(Profile.name).where(Profile.name.in_(all_names_in_file))
+            )
+            existing_names = {r[0] for r in existing_result.fetchall()}
+        else:
+            existing_names = set()
+
+        # ── Build insert batches skipping duplicates ───────────────────────
+        seen_in_file = set()
+
+        for row in all_rows:
+            name = row["name"].strip().lower()
+
+            # Skip duplicates from database
+            if name in existing_names:
+                skip_reasons["duplicate_name"] += 1
+                continue
+
+            # Skip duplicates within the file itself
+            if name in seen_in_file:
+                skip_reasons["duplicate_name"] += 1
+                continue
+
+            seen_in_file.add(name)
+
+            # Build profile record
+            from datetime import datetime, timezone
+            batch_to_insert.append({
+                "id":                   generate_uuid7(),
+                "name":                 name,
+                "gender":               row["gender"].strip().lower(),
+                "gender_probability":   float(row["gender_probability"]),
+                "age":                  int(row["age"]),
+                "age_group":            row["age_group"].strip().lower(),
+                "country_id":           row["country_id"].strip().upper(),
+                "country_name":         row["country_name"].strip(),
+                "country_probability":  float(row["country_probability"]),
+                "sample_size":          None,
+                "created_at":           datetime.now(timezone.utc).replace(tzinfo=None),
+            })
+
+            # ── Insert when batch is full ──────────────────────────────────
+            if len(batch_to_insert) >= BATCH_SIZE:
+                count = await insert_batch(db, batch_to_insert)
+                inserted_count  += count
+                batch_to_insert  = []
+
+        # ── Insert remaining rows (last partial batch) ─────────────────────
+        if batch_to_insert:
+            count = await insert_batch(db, batch_to_insert)
+            inserted_count += count
+
+        # ── Invalidate caches after upload ─────────────────────────────────
+        from app.services.cache import invalidate_prefix
+        await invalidate_prefix("profiles")
+        await invalidate_prefix("search")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={"status": "error", "message": f"Upload failed: {str(e)}"}
+        )
+
+    total_skipped = sum(skip_reasons.values())
+
+    return {
+        "status":     "success",
+        "total_rows": total_rows,
+        "inserted":   inserted_count,
+        "skipped":    total_skipped,
+        "reasons":    skip_reasons,
+    }
 
 
 # ─── GET /api/profiles/search ─────────────────────────────────────────────────
