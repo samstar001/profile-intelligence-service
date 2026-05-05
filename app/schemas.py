@@ -109,3 +109,20 @@ class TokenResponse(BaseModel):
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
+
+# ─── CSV Upload Response ───────────────────────────────────────────────────────
+
+class SkipReasons(BaseModel):
+    duplicate_name: int = 0
+    invalid_age: int = 0
+    invalid_gender: int = 0
+    missing_fields: int = 0
+    malformed_row: int = 0
+
+
+class CSVUploadResponse(BaseModel):
+    status: str
+    total_rows: int
+    inserted: int
+    skipped: int
+    reasons: SkipReasons

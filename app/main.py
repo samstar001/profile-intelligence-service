@@ -30,6 +30,22 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+
+    # ── Cache status check ─────────────────────────────────────────────────
+    from app.services.cache import CACHE_ENABLED, redis_client
+    if CACHE_ENABLED and redis_client:
+        try:
+            redis_client.set("startup_ping", "ok")
+            val = redis_client.get("startup_ping")
+            if val:
+                logger.info("Cache: Redis connection established ✓")
+            else:
+                logger.warning("Cache: Redis ping failed")
+        except Exception as e:
+            logger.warning(f"Cache: Redis check failed — {e}")
+    else:
+        logger.warning("Cache: Disabled — no Redis credentials")
+
     yield
 
 
